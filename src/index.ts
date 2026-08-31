@@ -42,6 +42,8 @@ interface Config {
   resourceId: string;
   projectId: string;
   auth: AuthConfig;
+  /** Optional APIM gateway URL to route streaming requests through (e.g. https://your-gw.azure-api.net/resource-path) */
+  apimGatewayUrl?: string;
 }
 
 // =============================================================================
@@ -164,6 +166,46 @@ interface ProviderAuth {
   getToken: () => Promise<string>;
 }
 const providerAuthMap = new Map<string, ProviderAuth>();
+
+/** APIM gateway URL override — if set, streaming requests route through it instead of the Foundry API */
+let APIM_GATEWAY_URL = "";
+
+/** Custom HTTP headers injected into every streaming request. Set via PI_AZURE_POST_HEADERS env var.
+ *  Format: "HeaderName:value1,HeaderName2:value2" */
+function parseCustomHeaders(): Record<string, string> {
+  const raw = process.env.PI_AZURE_POST_HEADERS;
+  if (!raw) return {};
+
+  const headers: Record<string, string> = {};
+  const pairs = raw.split(",");
+
+  for (const pair of pairs) {
+    const trimmed = pair.trim();
+    if (!trimmed) continue;
+    const colon = trimmed.indexOf(":");
+    if (colon === -1) throw new Error(
+      `[Azure Foundry] PI_AZURE_POST_HEADERS: invalid format "${trimmed}" — expected "Header:Value"`
+    );
+    const name = trimmed.slice(0, colon).trim();
+    const value = trimmed.slice(colon + 1).trim();
+    if (!name || !value) throw new Error(
+      `[Azure Foundry] PI_AZURE_POST_HEADERS: header "${trimmed}" has empty name or value`
+    );
+    const lc = name.toLowerCase();
+    const builtIn = new Set(["authorization", "content-type", "anthropic-version"]);
+    if (builtIn.has(lc)) throw new Error(
+      `[Azure Foundry] PI_AZURE_POST_HEADERS: "${name}" collides with a built-in header that this extension sets`
+    );
+    headers[name] = value;
+  }
+
+  const summary = Object.entries(headers)
+    .map(([k, v]) => `${k}:${v.slice(0, 20)}${v.length > 20 ? "…" : ""}`)
+    .join(", ");
+  console.log(`[Azure Foundry] PI_AZURE_POST_HEADERS: ${Object.keys(headers).length} header(s) — ${summary}`);
+
+  return headers;
+}
 
 function deploymentToModel(d: Deployment) {
   const modelName = d.modelName ?? d.name;
@@ -298,7 +340,7 @@ function streamOpenAI(
   baseHost: string, auth: ProviderAuth, route: Extract<ApiRoute, { kind: "openai-chat-completions" }>,
 ): Promise<void> {
   return (async () => {
-    const url = `${baseHost}/openai/deployments/${model.id}/chat/completions?api-version=2024-10-21`;
+    const url = `${APIM_GATEWAY_URL || baseHost}/openai/deployments/${model.id}/chat/completions?api-version=2024-10-21`;
     const maxOutput = options?.maxTokens ?? model.maxTokens;
     const body: Record<string, unknown> = {
       messages: toOpenAIMessages(context.systemPrompt, context.messages),
@@ -311,10 +353,11 @@ function streamOpenAI(
     const token = await auth.getToken();
     // OpenAI-compat route: api-key auth uses the "api-key" header;
     // Entra ID (azure-identity) uses "Authorization: Bearer".
+    const customHeaders = parseCustomHeaders();
     const authHeaders: Record<string, string> =
       auth.type === "api-key"
-        ? { "api-key": token }
-        : { "Authorization": `Bearer ${token}` };
+        ? { "api-key": token, ...customHeaders }
+        : { "Authorization": `Bearer ${token}`, ...customHeaders };
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeaders },
@@ -392,7 +435,9 @@ function streamAnthropic(
   baseHost: string, auth: ProviderAuth,
 ): Promise<void> {
   return (async () => {
-    const url = `${baseHost}/anthropic/v1/messages`;
+    const url = APIM_GATEWAY_URL
+      ? `${APIM_GATEWAY_URL}/anthropic/v1/messages`
+      : `${baseHost}/anthropic/v1/messages`;
     const body: Record<string, unknown> = {
       model: model.id,
       messages: toAnthropicMessages(context.messages),
@@ -405,11 +450,13 @@ function streamAnthropic(
     const token = await auth.getToken();
     // Anthropic route on Azure Foundry always uses "Authorization: Bearer"
     // regardless of auth type — api-key values are valid Bearer tokens here.
+    const customHeaders = parseCustomHeaders();
     const response = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${token}`,
+        ...customHeaders,
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify(body),
@@ -598,6 +645,12 @@ export default async function (pi: ExtensionAPI) {
   const providerId = "azure-foundry";
   // Store the auth context so streamAzureFoundry can build the right headers per-request.
   providerAuthMap.set(providerId, { type: config.auth.type, getToken });
+
+  // Support APIM gateway override — if set in config, route streaming through it
+  if (config.apimGatewayUrl) {
+    APIM_GATEWAY_URL = config.apimGatewayUrl.replace(/\/$/, "");
+    console.log(`[Azure Foundry] APIM gateway enabled: ${APIM_GATEWAY_URL}`);
+  }
 
   pi.registerProvider(providerId, {
     name: "Azure Foundry",
