@@ -117,19 +117,97 @@ interface ModelDefaults {
   input: ("text" | "image")[];
   /** OpenAI-compat token limit field; newer GPT-5/o-series models require max_completion_tokens */
   openaiTokenLimit?: OpenAITokenLimitParam;
+  thinking?: { mode: "effort"; efforts: string[] };
 }
 
 const MODEL_DEFAULTS: Record<string, ModelDefaults> = {
-  "claude-sonnet-4-5":  { contextWindow: 200000, maxTokens: 16384, reasoning: true,  input: ["text", "image"] },
-  "claude-sonnet-4-6":  { contextWindow: 200000, maxTokens: 16384, reasoning: true,  input: ["text", "image"] },
-  "claude-haiku-4-5":   { contextWindow: 200000, maxTokens: 16384, reasoning: false, input: ["text", "image"] },
-  "claude-opus-4-5":    { contextWindow: 200000, maxTokens: 32000, reasoning: true,  input: ["text", "image"] },
-  "gpt-5.4-nano":       { contextWindow: 128000, maxTokens: 16384, reasoning: false, input: ["text", "image"], openaiTokenLimit: "max_completion_tokens" },
-  "gpt-4o":             { contextWindow: 128000, maxTokens: 4096,  reasoning: false, input: ["text", "image"] },
-  "gpt-4o-mini":        { contextWindow: 128000, maxTokens: 4096,  reasoning: false, input: ["text", "image"] },
-  "Kimi-K2.5":          { contextWindow: 131072, maxTokens: 8192,  reasoning: false, input: ["text"] },
-  "Kimi-K2.6":          { contextWindow: 131072, maxTokens: 8192,  reasoning: false, input: ["text"] },
+  // Claude family
+  "claude-sonnet-4-5":   { contextWindow: 200000, maxTokens: 16384,  reasoning: true,  input: ["text", "image"] },
+  "claude-sonnet-4-6":   { contextWindow: 200000, maxTokens: 16384,  reasoning: true,  input: ["text", "image"] },
+  "claude-haiku-4-5":    { contextWindow: 200000, maxTokens: 16384,  reasoning: false, input: ["text", "image"] },
+  "claude-opus-4-5":     { contextWindow: 200000, maxTokens: 32000,  reasoning: true,  input: ["text", "image"] },
+
+  // GPT family
+  "gpt-5-mini":          { contextWindow: 400000, maxTokens: 128000, reasoning: true,  input: ["text", "image"], openaiTokenLimit: "max_completion_tokens", thinking: { mode: "effort", efforts: ["minimal", "low", "medium", "high"] } },
+  "gpt-5.4-nano":        { contextWindow: 128000, maxTokens: 16384,  reasoning: false, input: ["text", "image"], openaiTokenLimit: "max_completion_tokens" },
+  "gpt-4o":              { contextWindow: 128000, maxTokens: 4096,   reasoning: false, input: ["text", "image"] },
+  "gpt-4o-mini":         { contextWindow: 128000, maxTokens: 4096,   reasoning: false, input: ["text", "image"] },
+
+  // Kimi family — K2.5/K2.6 are older non-reasoning defaults kept for backwards compat;
+  // K2.7-Code is the current Azure Foundry deployment with full reasoning + vision.
+  "Kimi-K2.5":           { contextWindow: 131072, maxTokens: 8192,   reasoning: false, input: ["text"] },
+  "Kimi-K2.6":           { contextWindow: 131072, maxTokens: 8192,   reasoning: false, input: ["text"] },
+  "Kimi-K2.7-Code":      { contextWindow: 262144, maxTokens: 262144, reasoning: true,  input: ["text", "image"], thinking: { mode: "effort", efforts: ["minimal", "low", "medium", "high", "xhigh"] } },
+  "kimi-k2.7-code":      { contextWindow: 262144, maxTokens: 262144, reasoning: true,  input: ["text", "image"], thinking: { mode: "effort", efforts: ["minimal", "low", "medium", "high", "xhigh"] } },
+
+  // DeepSeek V4 family — Azure Foundry deployments ship 1M context / 128K output
+  // (distinct from upstream catalog which reports 384K output for direct API)
+  "DeepSeek-V4-Flash":   { contextWindow: 1000000, maxTokens: 128000, reasoning: true,  input: ["text"], thinking: { mode: "effort", efforts: ["low", "high", "max"] } },
+  "deepseek-v4-flash":   { contextWindow: 1000000, maxTokens: 128000, reasoning: true,  input: ["text"], thinking: { mode: "effort", efforts: ["low", "high", "max"] } },
+  "DeepSeek-V4-Pro":     { contextWindow: 1000000, maxTokens: 128000, reasoning: true,  input: ["text"], thinking: { mode: "effort", efforts: ["low", "high", "max"] } },
+  "deepseek-v4-pro":     { contextWindow: 1000000, maxTokens: 128000, reasoning: true,  input: ["text"], thinking: { mode: "effort", efforts: ["low", "high", "max"] } },
+
+  // XAI Grok family — Azure Foundry reports 200K context, 128K max output
+  "grok-4.6":            { contextWindow: 200000, maxTokens: 128000, reasoning: true,  input: ["text", "image"], thinking: { mode: "effort", efforts: ["low", "medium", "high", "xhigh"] } },
+  "grok-4-6":            { contextWindow: 200000, maxTokens: 128000, reasoning: true,  input: ["text", "image"], thinking: { mode: "effort", efforts: ["low", "medium", "high", "xhigh"] } },
+  "grok-4.6-medium":     { contextWindow: 200000, maxTokens: 128000, reasoning: true,  input: ["text", "image"], thinking: { mode: "effort", efforts: ["low", "medium", "high", "xhigh"] } },
 };
+
+// Normalised alias index for flexible deployment-name matching (case/separator-insensitive).
+// Keys are lower-cased, separator-folded variants pointing at canonical MODEL_DEFAULTS keys.
+const MODEL_ALIASES: Record<string, string> = (() => {
+  const aliases: Record<string, string> = {};
+  for (const key of Object.keys(MODEL_DEFAULTS)) {
+    const norm = key.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+    aliases[norm] = key;
+    aliases[norm.replace(/-/g, "")] = key;
+    aliases[norm.replace(/-/g, "_")] = key;
+  }
+  // Explicit cross-punctuation aliases for families that appear under many shapes on Foundry
+  aliases["deepseekv4flash"] = "DeepSeek-V4-Flash";
+  aliases["deepseek-v4-flash"] = "DeepSeek-V4-Flash";
+  aliases["deepseek_v4_flash"] = "DeepSeek-V4-Flash";
+  aliases["deepseekv4pro"] = "DeepSeek-V4-Pro";
+  aliases["deepseek-v4-pro"] = "DeepSeek-V4-Pro";
+  aliases["deepseek_v4_pro"] = "DeepSeek-V4-Pro";
+  aliases["kimik27code"] = "Kimi-K2.7-Code";
+  aliases["kimi-k2-7-code"] = "Kimi-K2.7-Code";
+  aliases["kimi_k2_7_code"] = "Kimi-K2.7-Code";
+  aliases["kimi-k27-code"] = "Kimi-K2.7-Code";
+  aliases["grok46"] = "grok-4.6";
+  aliases["grok4-6"] = "grok-4.6";
+  aliases["grok_4_6"] = "grok-4.6";
+  aliases["gpt5mini"] = "gpt-5-mini";
+  aliases["gpt-5-mini"] = "gpt-5-mini";
+  aliases["gpt_5_mini"] = "gpt-5-mini";
+  return aliases;
+})();
+
+function normalizeModelKey(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+function lookupModelDefaults(modelName: string): ModelDefaults | undefined {
+  // 1) exact
+  if (MODEL_DEFAULTS[modelName]) return MODEL_DEFAULTS[modelName];
+  // 2) normalised alias
+  const norm = normalizeModelKey(modelName);
+  const aliasKey = MODEL_ALIASES[norm] ?? MODEL_ALIASES[norm.replace(/-/g, "")];
+  if (aliasKey && MODEL_DEFAULTS[aliasKey]) return MODEL_DEFAULTS[aliasKey];
+  // 3) case-insensitive scan
+  const lower = modelName.toLowerCase();
+  for (const [k, v] of Object.entries(MODEL_DEFAULTS)) {
+    if (k.toLowerCase() === lower) return v;
+  }
+  // 4) substring fallback for Foundry deployment ids that embed model family
+  //    e.g. deployment "my-deepseek-v4-flash-eastus" should still resolve
+  for (const [k, v] of Object.entries(MODEL_DEFAULTS)) {
+    const kn = normalizeModelKey(k);
+    if (norm.includes(kn) || kn.includes(norm)) return v;
+  }
+  return undefined;
+}
+
 const FALLBACK: ModelDefaults = { contextWindow: 128000, maxTokens: 4096, reasoning: false, input: ["text"] };
 
 /** Per-deployment API route resolved at discovery time */
@@ -141,7 +219,8 @@ const apiRouteMap = new Map<string, ApiRoute>();
 
 /** Infer OpenAI-compat token limit from model name when not explicitly configured */
 function inferOpenAITokenLimit(modelName: string): OpenAITokenLimitParam {
-  if (MODEL_DEFAULTS[modelName]?.openaiTokenLimit) return MODEL_DEFAULTS[modelName].openaiTokenLimit!;
+  const d = lookupModelDefaults(modelName);
+  if (d?.openaiTokenLimit) return d.openaiTokenLimit!;
   // GPT-5 and o-series models reject max_tokens on Azure/OpenAI chat completions
   if (/^(gpt-5|o[1-9])([-.]|$)/i.test(modelName)) return "max_completion_tokens";
   return "max_tokens";
@@ -167,7 +246,8 @@ const providerAuthMap = new Map<string, ProviderAuth>();
 
 function deploymentToModel(d: Deployment) {
   const modelName = d.modelName ?? d.name;
-  const defaults = MODEL_DEFAULTS[modelName] ?? FALLBACK;
+  // Probe both modelName and deployment name for robustness (deployments may be aliased)
+  const defaults = lookupModelDefaults(modelName) ?? lookupModelDefaults(d.name) ?? FALLBACK;
   apiRouteMap.set(d.name, resolveApiRoute(d));
   return {
     id: d.name,
@@ -177,6 +257,7 @@ function deploymentToModel(d: Deployment) {
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: defaults.contextWindow,
     maxTokens: defaults.maxTokens,
+    ...(defaults.thinking ? { thinking: defaults.thinking } : {}),
   };
 }
 
@@ -348,7 +429,15 @@ function streamOpenAI(
       if (!choice?.delta) continue;
       const delta = choice.delta;
 
-      if (typeof delta.content === "string") {
+      // Reasoning / thinking deltas (DeepSeek `reasoning_content`, Kimi, Grok)
+      const reasoningDelta: string | undefined = delta.reasoning_content ?? delta.reasoning ?? delta.thinking;
+      if (typeof reasoningDelta === "string" && reasoningDelta.length > 0) {
+        let idx = output.content.findIndex((b) => b.type === "thinking");
+        if (idx === -1) { output.content.push({ type: "thinking", thinking: "", thinkingSignature: "" }); idx = output.content.length - 1; stream.push({ type: "thinking_start", contentIndex: idx, partial: output } as any); }
+        const block = output.content[idx] as any; if (block.type === "thinking") { block.thinking += reasoningDelta; stream.push({ type: "thinking_delta", contentIndex: idx, delta: reasoningDelta, partial: output } as any); }
+      }
+
+      if (typeof delta.content === "string" && delta.content.length > 0) {
         let idx = output.content.findIndex((b) => b.type === "text");
         if (idx === -1) { output.content.push({ type: "text", text: "" }); idx = output.content.length - 1; stream.push({ type: "text_start", contentIndex: idx, partial: output }); }
         const block = output.content[idx]; if (block.type === "text") { block.text += delta.content; stream.push({ type: "text_delta", contentIndex: idx, delta: delta.content, partial: output }); }
@@ -377,7 +466,11 @@ function streamOpenAI(
     }
 
     // Finalize blocks
-    for (let i = 0; i < output.content.length; i++) { if (output.content[i].type === "text") stream.push({ type: "text_end", contentIndex: i, content: (output.content[i] as TextContent).text, partial: output }); }
+    for (let i = 0; i < output.content.length; i++) {
+      const b = output.content[i] as any;
+      if (b.type === "text") stream.push({ type: "text_end", contentIndex: i, content: b.text, partial: output });
+      else if (b.type === "thinking") stream.push({ type: "thinking_end", contentIndex: i, content: b.thinking, partial: output } as any);
+    }
     for (const [tci, ci] of tcContentIdx) { const b = output.content[ci]; if (b.type === "toolCall") { try { b.arguments = JSON.parse(tcJsonBufs.get(tci) ?? "{}"); } catch {} stream.push({ type: "toolcall_end", contentIndex: ci, toolCall: b, partial: output }); } }
   })();
 }
