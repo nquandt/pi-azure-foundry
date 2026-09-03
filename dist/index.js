@@ -56,7 +56,7 @@ const MODEL_DEFAULTS = {
     "claude-haiku-4-5": { contextWindow: 200000, maxTokens: 16384, reasoning: false, input: ["text", "image"] },
     "claude-opus-4-5": { contextWindow: 200000, maxTokens: 32000, reasoning: true, input: ["text", "image"] },
     // GPT family
-    "gpt-5-mini": { contextWindow: 400000, maxTokens: 128000, reasoning: true, input: ["text", "image"], openaiTokenLimit: "max_completion_tokens", thinking: { mode: "effort", efforts: ["minimal", "low", "medium", "high"] } },
+    "gpt-5-mini": { contextWindow: 400000, maxTokens: 128000, reasoning: true, input: ["text", "image"], openaiTokenLimit: "max_completion_tokens", thinking: { mode: "effort", efforts: ["minimal", "low", "medium", "high"] }, sendEffort: true, defaultEffort: "medium" },
     "gpt-5.4-nano": { contextWindow: 128000, maxTokens: 16384, reasoning: false, input: ["text", "image"], openaiTokenLimit: "max_completion_tokens" },
     "gpt-4o": { contextWindow: 128000, maxTokens: 4096, reasoning: false, input: ["text", "image"] },
     "gpt-4o-mini": { contextWindow: 128000, maxTokens: 4096, reasoning: false, input: ["text", "image"] },
@@ -64,18 +64,18 @@ const MODEL_DEFAULTS = {
     // K2.7-Code is the current Azure Foundry deployment with full reasoning + vision.
     "Kimi-K2.5": { contextWindow: 131072, maxTokens: 8192, reasoning: false, input: ["text"] },
     "Kimi-K2.6": { contextWindow: 131072, maxTokens: 8192, reasoning: false, input: ["text"] },
-    "Kimi-K2.7-Code": { contextWindow: 262144, maxTokens: 262144, reasoning: true, input: ["text", "image"], thinking: { mode: "effort", efforts: ["minimal", "low", "medium", "high", "xhigh"] } },
-    "kimi-k2.7-code": { contextWindow: 262144, maxTokens: 262144, reasoning: true, input: ["text", "image"], thinking: { mode: "effort", efforts: ["minimal", "low", "medium", "high", "xhigh"] } },
+    "Kimi-K2.7-Code": { contextWindow: 262144, maxTokens: 262144, reasoning: true, input: ["text", "image"], },
+    "kimi-k2.7-code": { contextWindow: 262144, maxTokens: 262144, reasoning: true, input: ["text", "image"], },
     // DeepSeek V4 family — Azure Foundry deployments ship 1M context / 128K output
     // (distinct from upstream catalog which reports 384K output for direct API)
-    "DeepSeek-V4-Flash": { contextWindow: 1000000, maxTokens: 128000, reasoning: true, input: ["text"], thinking: { mode: "effort", efforts: ["low", "high", "max"] } },
-    "deepseek-v4-flash": { contextWindow: 1000000, maxTokens: 128000, reasoning: true, input: ["text"], thinking: { mode: "effort", efforts: ["low", "high", "max"] } },
-    "DeepSeek-V4-Pro": { contextWindow: 1000000, maxTokens: 128000, reasoning: true, input: ["text"], thinking: { mode: "effort", efforts: ["low", "high", "max"] } },
-    "deepseek-v4-pro": { contextWindow: 1000000, maxTokens: 128000, reasoning: true, input: ["text"], thinking: { mode: "effort", efforts: ["low", "high", "max"] } },
+    "DeepSeek-V4-Flash": { contextWindow: 1000000, maxTokens: 128000, reasoning: true, input: ["text"], thinking: { mode: "effort", efforts: ["high", "max"] }, sendEffort: true, defaultEffort: "high" },
+    "deepseek-v4-flash": { contextWindow: 1000000, maxTokens: 128000, reasoning: true, input: ["text"], thinking: { mode: "effort", efforts: ["high", "max"] }, sendEffort: true, defaultEffort: "high" },
+    "DeepSeek-V4-Pro": { contextWindow: 1000000, maxTokens: 128000, reasoning: true, input: ["text"], thinking: { mode: "effort", efforts: ["high", "max"] }, sendEffort: true, defaultEffort: "high" },
+    "deepseek-v4-pro": { contextWindow: 1000000, maxTokens: 128000, reasoning: true, input: ["text"], thinking: { mode: "effort", efforts: ["high", "max"] }, sendEffort: true, defaultEffort: "high" },
     // XAI Grok family — Azure Foundry reports 200K context, 128K max output
-    "grok-4.6": { contextWindow: 200000, maxTokens: 128000, reasoning: true, input: ["text", "image"], thinking: { mode: "effort", efforts: ["low", "medium", "high", "xhigh"] } },
-    "grok-4-6": { contextWindow: 200000, maxTokens: 128000, reasoning: true, input: ["text", "image"], thinking: { mode: "effort", efforts: ["low", "medium", "high", "xhigh"] } },
-    "grok-4.6-medium": { contextWindow: 200000, maxTokens: 128000, reasoning: true, input: ["text", "image"], thinking: { mode: "effort", efforts: ["low", "medium", "high", "xhigh"] } },
+    "grok-4.6": { contextWindow: 200000, maxTokens: 128000, reasoning: true, input: ["text", "image"], },
+    "grok-4-6": { contextWindow: 200000, maxTokens: 128000, reasoning: true, input: ["text", "image"], },
+    "grok-4.6-medium": { contextWindow: 200000, maxTokens: 128000, reasoning: true, input: ["text", "image"], },
 };
 // Normalised alias index for flexible deployment-name matching (case/separator-insensitive).
 // Keys are lower-cased, separator-folded variants pointing at canonical MODEL_DEFAULTS keys.
@@ -135,6 +135,7 @@ function lookupModelDefaults(modelName) {
 }
 const FALLBACK = { contextWindow: 128000, maxTokens: 4096, reasoning: false, input: ["text"] };
 const apiRouteMap = new Map();
+const effortPolicyMap = new Map();
 /** Infer OpenAI-compat token limit from model name when not explicitly configured */
 function inferOpenAITokenLimit(modelName) {
     const d = lookupModelDefaults(modelName);
@@ -162,6 +163,11 @@ function deploymentToModel(d) {
     // Probe both modelName and deployment name for robustness (deployments may be aliased)
     const defaults = lookupModelDefaults(modelName) ?? lookupModelDefaults(d.name) ?? FALLBACK;
     apiRouteMap.set(d.name, resolveApiRoute(d));
+    effortPolicyMap.set(d.name, {
+        send: defaults.sendEffort === true,
+        values: defaults.thinking?.efforts ?? [],
+        defaultEffort: defaults.defaultEffort ?? defaults.thinking?.efforts?.[Math.floor((defaults.thinking?.efforts?.length ?? 1) / 2)] ?? "medium",
+    });
     return {
         id: d.name,
         name: d.modelName ?? d.name,
@@ -317,17 +323,25 @@ function streamOpenAI(model, context, options, output, stream, baseHost, auth, r
         // Pi/OMP passes the user's effort dial as options.reasoning (Effort) and
         // fast-path opt-outs as options.disableReasoning.
         {
-            const thinkingEfforts = (model.thinking)?.efforts;
-            if (model.reasoning && thinkingEfforts?.length) {
+            // Foundry quirk map (verified live per family):
+            // - DeepSeek V4: no param = no reasoning (Playground "none" default).
+            //   Send one of [high, max]; "none" disables (200 OK).
+            // - gpt-5-mini: effort steers depth 160 -> 840 completion tokens
+            //   across minimal..high; "none" accepted.
+            // - Kimi-K2.7-Code: reasons by default; param unneeded, and "none"
+            //   leaks chain-of-thought as visible text. Send nothing.
+            // - grok-4.6: ignores "high", 400s on "none". Send nothing.
+            const policy = effortPolicyMap.get(model.id);
+            if (policy?.send) {
                 if (options?.disableReasoning) {
                     body.reasoning_effort = "none";
                 }
                 else {
                     const requestedEffort = options?.reasoning;
                     body.reasoning_effort =
-                        requestedEffort && thinkingEfforts.includes(requestedEffort)
+                        requestedEffort && policy.values.includes(requestedEffort)
                             ? requestedEffort
-                            : thinkingEfforts[Math.floor(thinkingEfforts.length / 2)];
+                            : policy.defaultEffort;
                 }
             }
         }
