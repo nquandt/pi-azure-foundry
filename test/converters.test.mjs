@@ -107,5 +107,16 @@ console.log("turn with two tool calls");
   check("anthropic: results merged into one user message", msgs.length === 4, `got ${msgs.length}: ${JSON.stringify(msgs)}`);
 }
 
+console.log("array system prompt and bare-string blocks (OMP 18.1.6)");
+{
+  const o = toOpenAIMessages(["a", "b"], [{ role: "user", content: "hi" }]);
+  check("openai: array system collapsed to string", o[0].role === "system" && o[0].content === "a\n\nb", JSON.stringify(o[0]));
+  const o2 = toOpenAIMessages("sys", [{ role: "user", content: [{ type: "text", text: "hi" }, "yo"] }]);
+  const uc = o2.find((m) => m.role === "user").content;
+  check("openai: bare-string items kept as text", uc.some((c) => c.type === "text" && c.text === "yo"), JSON.stringify(uc));
+  const o3 = toOpenAIMessages([], [{ role: "user", content: "hi" }]);
+  check("openai: empty array system omitted", !o3.some((m) => m.role === "system"), JSON.stringify(o3));
+}
+
 console.log(failures ? `\n${failures} failing check(s)` : "\nall checks passed");
 process.exit(failures ? 1 : 0);
