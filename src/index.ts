@@ -320,12 +320,78 @@ async function* parseSSE(reader: ReadableStreamDefaultReader<Uint8Array>): Async
 }
 
 // =============================================================================
+// History repair
+// =============================================================================
+
+/**
+ * Both provider APIs reject histories that pi is willing to persist.
+ *
+ * A turn that is aborted or that errors is stored with its tool calls intact but
+ * no tool results, and often with an empty thinking block or no content at all.
+ * Replaying that verbatim produces a hard 400 on every subsequent request, so
+ * the session is bricked from the first interrupt onward.
+ *
+ * This pass makes any stored history sendable:
+ *   - drops assistant turns that carry nothing renderable
+ *   - synthesizes an error tool result for every unanswered tool call
+ */
+function repairMessages(messages: Message[]): Message[] {
+  const out: Message[] = [];
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg.role !== "assistant") {
+      out.push(msg);
+      continue;
+    }
+
+    // Aborted/errored turns persist as [] or as a lone empty thinking block.
+    const usable = msg.content.filter((b) =>
+      (b.type === "text" && (b as TextContent).text.trim()) ||
+      (b.type === "thinking" && (b as ThinkingContent).thinking) ||
+      b.type === "toolCall"
+    );
+    if (!usable.length) continue;
+
+    out.push(msg);
+
+    const calls = msg.content.filter((b) => b.type === "toolCall");
+    if (!calls.length) continue;
+
+    // Tool results for this turn are the run of toolResult messages that follows.
+    const answered = new Set<string>();
+    let j = i + 1;
+    for (; j < messages.length && messages[j].role === "toolResult"; j++) {
+      answered.add((messages[j] as ToolResultMessage).toolCallId);
+      out.push(messages[j]);
+    }
+
+    for (const b of calls) {
+      const id = (b as any).id as string;
+      if (answered.has(id)) continue;
+      out.push({
+        role: "toolResult",
+        toolCallId: id,
+        toolName: (b as any).name,
+        content: [{ type: "text", text: "Tool call did not complete (interrupted)." }],
+        isError: true,
+      } as ToolResultMessage);
+    }
+
+    i = j - 1;
+  }
+
+  return out;
+}
+
+// =============================================================================
 // OpenAI-format message conversion  (for OpenAI / MoonshotAI / etc.)
 // =============================================================================
 
 function toOpenAIMessages(systemPrompt: string | undefined, messages: Message[]): unknown[] {
   const out: unknown[] = [];
   if (systemPrompt) out.push({ role: "system", content: systemPrompt });
+  messages = repairMessages(messages);
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -345,7 +411,9 @@ function toOpenAIMessages(systemPrompt: string | undefined, messages: Message[])
       const tcs = msg.content.filter((b) => b.type === "toolCall").map((b) => ({
         id: (b as any).id, type: "function", function: { name: (b as any).name, arguments: JSON.stringify((b as any).arguments) },
       }));
-      if (text) entry.content = text;
+      // Always a string: Azure's OpenAI route rejects a null/absent content on
+      // an assistant turn, which is what a tool-call-only turn used to produce.
+      entry.content = text;
       if (tcs.length) entry.tool_calls = tcs;
       out.push(entry);
     } else if (msg.role === "toolResult") {
@@ -366,6 +434,7 @@ function toOpenAITools(tools: Tool[]): unknown[] {
 
 function toAnthropicMessages(messages: Message[]): unknown[] {
   const out: unknown[] = [];
+  messages = repairMessages(messages);
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     if (msg.role === "user") {
@@ -382,15 +451,28 @@ function toAnthropicMessages(messages: Message[]): unknown[] {
       const blocks: unknown[] = [];
       for (const b of msg.content) {
         if (b.type === "text" && (b as TextContent).text.trim()) blocks.push({ type: "text", text: (b as TextContent).text });
-        if (b.type === "thinking") blocks.push({ type: "thinking", thinking: (b as ThinkingContent).thinking, signature: (b as ThinkingContent).thinkingSignature ?? "" });
+        // Anthropic rejects a thinking block whose text is empty, even when the
+        // signature is valid. pi persists exactly that shape, so skip them.
+        if (b.type === "thinking" && (b as ThinkingContent).thinking) blocks.push({ type: "thinking", thinking: (b as ThinkingContent).thinking, signature: (b as ThinkingContent).thinkingSignature ?? "" });
         if (b.type === "toolCall") blocks.push({ type: "tool_use", id: (b as any).id, name: (b as any).name, input: (b as any).arguments });
       }
       if (blocks.length) out.push({ role: "assistant", content: blocks });
     } else if (msg.role === "toolResult") {
       const m = msg as ToolResultMessage;
       const text = m.content.filter((c): c is TextContent => c.type === "text").map((c) => c.text).join("\n");
-      // Anthropic tool results go inside a user message
-      out.push({ role: "user", content: [{ type: "tool_result", tool_use_id: m.toolCallId, content: text, is_error: m.isError }] });
+      const block = { type: "tool_result", tool_use_id: m.toolCallId, content: text, is_error: m.isError };
+      // Anthropic tool results go inside a user message, and every result for a
+      // turn must sit in the one message that follows it. A turn with N tool
+      // calls therefore needs its N results merged into a single user message,
+      // not emitted as N consecutive ones.
+      const prev = out[out.length - 1] as { role?: string; content?: unknown[] } | undefined;
+      const isResultCarrier =
+        prev?.role === "user" &&
+        Array.isArray(prev.content) &&
+        prev.content.length > 0 &&
+        prev.content.every((b) => (b as { type?: string }).type === "tool_result");
+      if (isResultCarrier) (prev!.content as unknown[]).push(block);
+      else out.push({ role: "user", content: [block] });
     }
   }
   return out;
@@ -722,3 +804,6 @@ export default async function (pi: ExtensionAPI) {
 
   console.log(`[Azure Foundry] ✓ Registered ${deployments.length} model(s)`);
 }
+
+// Exported for tests.
+export { repairMessages, toOpenAIMessages, toAnthropicMessages };

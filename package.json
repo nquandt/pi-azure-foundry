@@ -42,7 +42,8 @@
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
     "prebuild": "npm run clean",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "test": "node test/history-repair.test.mjs"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^0.80.6",
