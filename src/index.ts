@@ -399,6 +399,25 @@ function streamOpenAI(
       stream_options: { include_usage: true },
     };
     if (context.tools?.length) body.tools = toOpenAITools(context.tools);
+    // Reasoning effort: this Foundry endpoint defaults to NO reasoning when the
+    // param is absent (mirrors the Playground's "Reasoning Effort: none" default),
+    // so an explicit effort is required to get thinking out of DeepSeek V4.
+    // Pi/OMP passes the user's effort dial as options.reasoning (Effort) and
+    // fast-path opt-outs as options.disableReasoning.
+    {
+      const thinkingEfforts = ((model as unknown as { thinking?: { efforts?: string[] } }).thinking)?.efforts;
+      if (model.reasoning && thinkingEfforts?.length) {
+        if ((options as { disableReasoning?: boolean } | undefined)?.disableReasoning) {
+          body.reasoning_effort = "none";
+        } else {
+          const requestedEffort = (options as { reasoning?: string } | undefined)?.reasoning;
+          body.reasoning_effort =
+            requestedEffort && thinkingEfforts.includes(requestedEffort)
+              ? requestedEffort
+              : thinkingEfforts[Math.floor(thinkingEfforts.length / 2)];
+        }
+      }
+    }
 
     const token = await auth.getToken();
     // OpenAI-compat route: api-key auth uses the "api-key" header;

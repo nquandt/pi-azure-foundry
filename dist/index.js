@@ -311,6 +311,26 @@ function streamOpenAI(model, context, options, output, stream, baseHost, auth, r
         };
         if (context.tools?.length)
             body.tools = toOpenAITools(context.tools);
+        // Reasoning effort: this Foundry endpoint defaults to NO reasoning when the
+        // param is absent (mirrors the Playground's "Reasoning Effort: none" default),
+        // so an explicit effort is required to get thinking out of DeepSeek V4.
+        // Pi/OMP passes the user's effort dial as options.reasoning (Effort) and
+        // fast-path opt-outs as options.disableReasoning.
+        {
+            const thinkingEfforts = (model.thinking)?.efforts;
+            if (model.reasoning && thinkingEfforts?.length) {
+                if (options?.disableReasoning) {
+                    body.reasoning_effort = "none";
+                }
+                else {
+                    const requestedEffort = options?.reasoning;
+                    body.reasoning_effort =
+                        requestedEffort && thinkingEfforts.includes(requestedEffort)
+                            ? requestedEffort
+                            : thinkingEfforts[Math.floor(thinkingEfforts.length / 2)];
+                }
+            }
+        }
         const token = await auth.getToken();
         // OpenAI-compat route: api-key auth uses the "api-key" header;
         // Entra ID (azure-identity) uses "Authorization: Bearer".
