@@ -380,9 +380,20 @@ function streamOpenAI(
 ): Promise<void> {
   return (async () => {
     const url = `${baseHost}/openai/deployments/${model.id}/chat/completions?api-version=2024-10-21`;
-    const maxOutput = options?.maxTokens ?? model.maxTokens;
+    const openAIMessages = toOpenAIMessages(context.systemPrompt, context.messages);
+    // Cap the wire request so input + completion never exceeds the context window.
+    // Kimi-K2.7-Code reports maxTokens == contextWindow (262144); requesting the
+    // full budget plus any input 400s. Estimate input at ~4 chars/token.
+    const requested = options?.maxTokens ?? model.maxTokens;
+    let maxOutput = requested;
+    if (model.contextWindow) {
+      const inputEstimate = Math.ceil(JSON.stringify(openAIMessages).length / 4);
+      const headroom = model.contextWindow - inputEstimate - 256;
+      if (headroom > 0) maxOutput = Math.min(requested, headroom);
+      else maxOutput = Math.min(requested, Math.max(1024, model.contextWindow - 256));
+    }
     const body: Record<string, unknown> = {
-      messages: toOpenAIMessages(context.systemPrompt, context.messages),
+      messages: openAIMessages,
       [route.tokenLimit]: maxOutput,
       stream: true,
       stream_options: { include_usage: true },
