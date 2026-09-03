@@ -449,9 +449,34 @@ function streamOpenAI(
       }
 
       if (typeof delta.content === "string" && delta.content.length > 0) {
-        let idx = output.content.findIndex((b) => b.type === "text");
-        if (idx === -1) { output.content.push({ type: "text", text: "" }); idx = output.content.length - 1; stream.push({ type: "text_start", contentIndex: idx, partial: output }); }
-        const block = output.content[idx]; if (block.type === "text") { block.text += delta.content; stream.push({ type: "text_delta", contentIndex: idx, delta: delta.content, partial: output }); }
+        // Microsoft Foundry serves some DeepSeek reasoners (notably R1) with thinking
+        // inline in content inside <think>...</think> tags rather than a dedicated
+        // reasoning_content delta. Split complete pairs out into thinking blocks so
+        // Pi/OMP renders them as thinking instead of visible tag soup.
+        // (V4-Flash/Pro currently emit neither; this is a no-op for them.)
+        let remainder = delta.content;
+        const thinkRe = /<think>([\s\S]*?)<\/think>/;
+        let m: RegExpExecArray | null;
+        while ((m = thinkRe.exec(remainder)) !== null) {
+          const before = remainder.slice(0, m.index);
+          if (before) {
+            let idx = output.content.findIndex((b) => b.type === "text");
+            if (idx === -1) { output.content.push({ type: "text", text: "" }); idx = output.content.length - 1; stream.push({ type: "text_start", contentIndex: idx, partial: output }); }
+            const block = output.content[idx]; if (block.type === "text") { block.text += before; stream.push({ type: "text_delta", contentIndex: idx, delta: before, partial: output }); }
+          }
+          const inner = m[1];
+          if (inner) {
+            let idx = output.content.findIndex((b) => b.type === "thinking");
+            if (idx === -1) { output.content.push({ type: "thinking", thinking: "", thinkingSignature: "" }); idx = output.content.length - 1; stream.push({ type: "thinking_start", contentIndex: idx, partial: output } as any); }
+            const block = output.content[idx] as any; if (block.type === "thinking") { block.thinking += inner; stream.push({ type: "thinking_delta", contentIndex: idx, delta: inner, partial: output } as any); }
+          }
+          remainder = remainder.slice(m.index + m[0].length);
+        }
+        if (remainder) {
+          let idx = output.content.findIndex((b) => b.type === "text");
+          if (idx === -1) { output.content.push({ type: "text", text: "" }); idx = output.content.length - 1; stream.push({ type: "text_start", contentIndex: idx, partial: output }); }
+          const block = output.content[idx]; if (block.type === "text") { block.text += remainder; stream.push({ type: "text_delta", contentIndex: idx, delta: remainder, partial: output }); }
+        }
       }
 
       if (delta.tool_calls) {
