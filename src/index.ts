@@ -394,11 +394,37 @@ async function* parseSSE(reader: ReadableStreamDefaultReader<Uint8Array>): Async
 // OpenAI-format message conversion  (for OpenAI / MoonshotAI / etc.)
 // =============================================================================
 
+/**
+ * OMP >=18.1.6 may pass the system prompt as a string array (Pi passes a
+ * string). Foundry's OpenAI route rejects array-of-string content with a 400,
+ * and strict backends (MoonshotAI/Kimi) 422 it — always collapse to one string.
+ */
+function normalizeSystemPrompt(sp: unknown): string | undefined {
+  if (sp == null) return undefined;
+  if (typeof sp === "string") return sp.length ? sp : undefined;
+  if (Array.isArray(sp)) {
+    const joined = sp
+      .map((b) => (typeof b === "string" ? b : (b as { text?: unknown })?.text ?? ""))
+      .filter((s): s is string => typeof s === "string" && s.length > 0)
+      .join("\n\n");
+    return joined.length ? joined : undefined;
+  }
+  return String(sp);
+}
+
+/** A content block that may arrive as a bare string (OMP 18.1.6) instead of {type:"text"}. */
+function blockText(c: unknown): string | undefined {
+  if (typeof c === "string") return c;
+  const b = c as { type?: string; text?: unknown };
+  return b?.type === "text" && typeof b.text === "string" ? b.text : undefined;
+}
+
 function toOpenAIMessages(
-  systemPrompt: string | undefined, messages: Message[], opts: { replayReasoningContent?: boolean } = {},
+  systemPrompt: unknown, messages: Message[], opts: { replayReasoningContent?: boolean } = {},
 ): unknown[] {
   const out: unknown[] = [];
-  if (systemPrompt) out.push({ role: "system", content: systemPrompt });
+  const system = normalizeSystemPrompt(systemPrompt);
+  if (system) out.push({ role: "system", content: system });
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -406,11 +432,15 @@ function toOpenAIMessages(
       if (typeof msg.content === "string") {
         out.push({ role: "user", content: msg.content });
       } else {
-        out.push({ role: "user", content: msg.content.map((c) =>
-          c.type === "text"  ? { type: "text", text: (c as TextContent).text } :
-          c.type === "image" ? { type: "image_url", image_url: { url: `data:${(c as ImageContent).mimeType};base64,${(c as ImageContent).data}` } } :
-          { type: "text", text: "" }
-        )});
+        out.push({ role: "user", content: (msg.content as unknown[]).map((c) => {
+          const t = blockText(c);
+          if (t !== undefined) return { type: "text", text: t };
+          if ((c as { type?: string }).type === "image") {
+            const img = c as ImageContent;
+            return { type: "image_url", image_url: { url: `data:${img.mimeType};base64,${img.data}` } };
+          }
+          return { type: "text", text: "" };
+        })});
       }
     } else if (msg.role === "assistant") {
       const entry: Record<string, unknown> = { role: "assistant" };
@@ -452,11 +482,15 @@ function toAnthropicMessages(messages: Message[]): unknown[] {
       if (typeof msg.content === "string") {
         out.push({ role: "user", content: msg.content });
       } else {
-        out.push({ role: "user", content: msg.content.map((c) =>
-          c.type === "text" ? { type: "text", text: (c as TextContent).text } :
-          c.type === "image" ? { type: "image", source: { type: "base64", media_type: (c as ImageContent).mimeType, data: (c as ImageContent).data } } :
-          { type: "text", text: "" }
-        )});
+        out.push({ role: "user", content: (msg.content as unknown[]).map((c) => {
+          const t = blockText(c);
+          if (t !== undefined) return { type: "text", text: t };
+          if ((c as { type?: string }).type === "image") {
+            const img = c as ImageContent;
+            return { type: "image", source: { type: "base64", media_type: img.mimeType, data: img.data } };
+          }
+          return { type: "text", text: "" };
+        })});
       }
     } else if (msg.role === "assistant") {
       const blocks: unknown[] = [];
@@ -571,9 +605,29 @@ function streamOpenAI(
       }
 
       if (typeof delta.content === "string" && delta.content.length > 0) {
-        let idx = output.content.findIndex((b) => b.type === "text");
-        if (idx === -1) { output.content.push({ type: "text", text: "" }); idx = output.content.length - 1; stream.push({ type: "text_start", contentIndex: idx, partial: output }); }
-        const block = output.content[idx]; if (block.type === "text") { block.text += delta.content; stream.push({ type: "text_delta", contentIndex: idx, delta: delta.content, partial: output }); }
+        // Foundry serves some DeepSeek reasoners (notably R1) with thinking
+        // inline in content inside <think>...</think> tags rather than a
+        // dedicated delta (Microsoft's own Foundry docs describe this shape).
+        // Split complete pairs out into thinking blocks; no-op otherwise.
+        let remainder = delta.content;
+        const thinkRe = /<think>([\s\S]*?)<\/think>/;
+        let m: RegExpExecArray | null;
+        const emitText = (s: string) => {
+          if (!s) return;
+          let idx = output.content.findIndex((b) => b.type === "text");
+          if (idx === -1) { output.content.push({ type: "text", text: "" }); idx = output.content.length - 1; stream.push({ type: "text_start", contentIndex: idx, partial: output }); }
+          const block = output.content[idx]; if (block.type === "text") { block.text += s; stream.push({ type: "text_delta", contentIndex: idx, delta: s, partial: output }); }
+        };
+        while ((m = thinkRe.exec(remainder)) !== null) {
+          emitText(remainder.slice(0, m.index));
+          if (m[1]) {
+            let idx = output.content.findIndex((b) => b.type === "thinking");
+            if (idx === -1) { output.content.push({ type: "thinking", thinking: "" } as ThinkingContent); idx = output.content.length - 1; stream.push({ type: "thinking_start", contentIndex: idx, partial: output }); }
+            const block = output.content[idx]; if (block.type === "thinking") { (block as ThinkingContent).thinking += m[1]; stream.push({ type: "thinking_delta", contentIndex: idx, delta: m[1], partial: output }); }
+          }
+          remainder = remainder.slice(m.index + m[0].length);
+        }
+        emitText(remainder);
       }
 
       if (delta.tool_calls) {
@@ -625,7 +679,10 @@ function streamAnthropic(
       max_tokens: options?.maxTokens ?? model.maxTokens,
       stream: true,
     };
-    if (context.systemPrompt) body.system = context.systemPrompt;
+    {
+      const system = normalizeSystemPrompt(context.systemPrompt);
+      if (system) body.system = system;
+    }
     if (context.tools?.length) body.tools = toAnthropicTools(context.tools);
 
     const token = await auth.getToken();

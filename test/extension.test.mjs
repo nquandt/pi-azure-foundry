@@ -190,6 +190,23 @@ console.log("openai route: non-gpt-5 model uses max_tokens");
   check("plain text reply, stopReason stop", message.content[0]?.text === "391" && message.stopReason === "stop", JSON.stringify(message));
 }
 
+console.log("openai route: array system prompt and think-tag split");
+{
+  nextChat = { sse: [
+    { choices: [{ delta: { content: "Hi <think>considering</think> there" } }] },
+    { choices: [{ delta: { content: "!" }, finish_reason: "stop" }] },
+    "[DONE]",
+  ] };
+  const before = requests.length;
+  const { message } = await run("DeepSeek-V4-Flash", { systemPrompt: ["a", "b"], messages: [{ role: "user", content: "hi" }] }, { reasoning: "high" });
+  const body = JSON.parse(requests[before].init.body);
+  check("array system prompt collapsed to string", body.messages[0].role === "system" && body.messages[0].content === "a\n\nb", JSON.stringify(body.messages[0]));
+  const thinking = message.content.find((b) => b.type === "thinking");
+  const txt = message.content.find((b) => b.type === "text");
+  check("think tags split into a thinking block", thinking?.thinking === "considering", JSON.stringify(thinking));
+  check("surrounding text has no tag leakage", txt?.text === "Hi  there!", JSON.stringify(txt));
+}
+
 console.log("anthropic route: request shape and streaming");
 {
   nextChat = { sse: [
