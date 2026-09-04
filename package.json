@@ -42,12 +42,12 @@
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
     "prebuild": "npm run clean",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "test": "npm run build && node test/converters.test.mjs && node test/extension.test.mjs"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.80.6",
-    "@earendil-works/pi-coding-agent": "^0.80.6",
-    "@types/node": "^20",
+    "@earendil-works/pi-coding-agent": "^0.84.4",
+    "@types/node": "^20.19.43",
     "typescript": "^5"
   },
   "peerDependencies": {
@@ -59,10 +59,13 @@
     }
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.19.0"
   },
   "dependencies": {
-    "@azure/identity": "^4.13.1",
-    "@earendil-works/pi-ai": "^0.80.6"
-  }
+    "@azure/identity": "^4.13.2",
+    "@earendil-works/pi-ai": "^0.84.4"
+  },
+  "bundleDependencies": [
+    "@azure/identity"
+  ]
 }

@@ -24,6 +24,7 @@ import {
   type ToolResultMessage,
   type ModelCost,
   calculateCost,
+  clampThinkingLevel,
   createAssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
 import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
@@ -37,6 +38,7 @@ import { DEEPSEEK_MODELS } from "@earendil-works/pi-ai/providers/deepseek.models
 import { XAI_MODELS } from "@earendil-works/pi-ai/providers/xai.models";
 import { MOONSHOTAI_MODELS } from "@earendil-works/pi-ai/providers/moonshotai.models";
 import { MOONSHOTAI_CN_MODELS } from "@earendil-works/pi-ai/providers/moonshotai-cn.models";
+import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
@@ -59,6 +61,14 @@ interface ModelConfigOverride {
   input?: ("text" | "image")[];
   cost?: ModelCost;
   openaiTokenLimit?: OpenAITokenLimitParam;
+  /**
+   * pi thinking level → wire `reasoning_effort` value. `null` means the level is
+   * not offered; a string for `off` is sent when reasoning is disabled (e.g.
+   * "none"); an absent/`null` `off` sends nothing when reasoning is disabled.
+   */
+  thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
+  /** Whether to send `reasoning_effort` on the OpenAI-compatible route at all. */
+  supportsReasoningEffort?: boolean;
 }
 
 interface Config {
@@ -66,6 +76,18 @@ interface Config {
   projectId: string;
   auth: AuthConfig;
   models?: Record<string, ModelConfigOverride>;
+  /**
+   * Optional gateway base URL (e.g. an Azure API Management front door such as
+   * https://my-gw.azure-api.net/foundry). When set, chat requests are sent to
+   * this host instead of the Foundry endpoint. Deployment discovery still uses
+   * the Foundry endpoint. The same route paths are appended in both cases.
+   */
+  gatewayUrl?: string;
+  /**
+   * Optional extra HTTP headers sent on every chat request (e.g. an APIM
+   * subscription key). Auth headers set by the extension always take precedence.
+   */
+  headers?: Record<string, string>;
 }
 
 // =============================================================================
@@ -140,6 +162,10 @@ interface ResolvedModelDetails {
   cost: ModelCost;
   thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
   openaiTokenLimit?: OpenAITokenLimitParam;
+  /** Send `reasoning_effort` on the OpenAI-compatible route (catalog compat default: true). */
+  supportsReasoningEffort: boolean;
+  /** Model needs `reasoning_content` on replayed assistant turns (DeepSeek). */
+  requiresReasoningContent: boolean;
   source: "config" | "catalog" | "fallback";
 }
 
@@ -151,6 +177,8 @@ const FALLBACK: ResolvedModelDetails = {
   reasoning: false,
   input: ["text"],
   cost: ZERO_COST,
+  supportsReasoningEffort: true,
+  requiresReasoningContent: false,
   source: "fallback",
 };
 
@@ -202,8 +230,11 @@ function resolveModelDetails(
   // Start with catalog metadata, or the conservative fallback if unknown.
   const base: ResolvedModelDetails = catalogModel
     ? (() => {
-        const compatMaxTokensField = (catalogModel as any).compat?.maxTokensField;
+        const compat = (catalogModel as any).compat ?? {};
+        const compatMaxTokensField = compat.maxTokensField;
         return {
+          supportsReasoningEffort: compat.supportsReasoningEffort !== false,
+          requiresReasoningContent: compat.requiresReasoningContentOnAssistantMessages === true,
           contextWindow: catalogModel.contextWindow,
           maxTokens: catalogModel.maxTokens,
           reasoning: catalogModel.reasoning,
@@ -234,9 +265,17 @@ function resolveModelDetails(
 }
 
 /** Per-deployment API route resolved at discovery time */
+interface OpenAIReasoningPolicy {
+  /** Model reasons and accepts `reasoning_effort`. */
+  enabled: boolean;
+  thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
+  /** Replay `reasoning_content` on assistant turns (DeepSeek requires it). */
+  replayReasoningContent: boolean;
+}
+
 type ApiRoute =
   | { kind: "anthropic-messages" }
-  | { kind: "openai-chat-completions"; tokenLimit: OpenAITokenLimitParam };
+  | { kind: "openai-chat-completions"; tokenLimit: OpenAITokenLimitParam; reasoning: OpenAIReasoningPolicy };
 
 const apiRouteMap = new Map<string, ApiRoute>();
 
@@ -251,7 +290,35 @@ function inferOpenAITokenLimit(modelName: string, resolved: ResolvedModelDetails
 function resolveApiRoute(d: Deployment, resolved: ResolvedModelDetails): ApiRoute {
   if (d.modelPublisher === "Anthropic") return { kind: "anthropic-messages" };
   const modelName = d.modelName ?? d.name;
-  return { kind: "openai-chat-completions", tokenLimit: inferOpenAITokenLimit(modelName, resolved) };
+  return {
+    kind: "openai-chat-completions",
+    tokenLimit: inferOpenAITokenLimit(modelName, resolved),
+    reasoning: {
+      enabled: resolved.reasoning && resolved.supportsReasoningEffort,
+      thinkingLevelMap: resolved.thinkingLevelMap,
+      replayReasoningContent: resolved.requiresReasoningContent,
+    },
+  };
+}
+
+/**
+ * Resolve the wire `reasoning_effort` for a request, or undefined to omit it.
+ *
+ * Foundry defaults to no reasoning when the field is absent, and families
+ * disagree on which values they accept. The catalog's thinkingLevelMap encodes
+ * that: pi's level is clamped to a supported one, then mapped to the wire
+ * value. For "off", a string mapping (e.g. "none") is sent; null/absent sends
+ * nothing, which matters for models that reject "none".
+ */
+function resolveReasoningEffort(policy: OpenAIReasoningPolicy, requested: SimpleStreamOptions["reasoning"]): string | undefined {
+  if (!policy.enabled) return undefined;
+  const map = policy.thinkingLevelMap;
+  const probe = { reasoning: true, thinkingLevelMap: map } as Model<Api>;
+  const level = requested ? clampThinkingLevel(probe, requested) : "off";
+  const mapped = map?.[level];
+  if (level === "off") return typeof mapped === "string" ? mapped : undefined;
+  if (mapped === null) return undefined;
+  return mapped ?? level;
 }
 
 function describeApiRoute(route: ApiRoute): string {
@@ -263,6 +330,10 @@ function describeApiRoute(route: ApiRoute): string {
 interface ProviderAuth {
   type: AuthConfig["type"];
   getToken: () => Promise<string>;
+  /** Host to send chat requests to. Defaults to the Foundry endpoint origin. */
+  gatewayUrl?: string;
+  /** Extra headers applied to every chat request, below the auth headers. */
+  headers: Record<string, string>;
 }
 const providerAuthMap = new Map<string, ProviderAuth>();
 
@@ -320,12 +391,33 @@ async function* parseSSE(reader: ReadableStreamDefaultReader<Uint8Array>): Async
 }
 
 // =============================================================================
+// Shared conversion helpers
+// =============================================================================
+
+/**
+ * pi passes systemPrompt as a string. Some pi forks (OMP) pass a string array.
+ * Collapse to one string so neither route forwards a shape the API rejects.
+ */
+function normalizeSystemPrompt(sp: unknown): string | undefined {
+  if (Array.isArray(sp)) { const joined = sp.filter((x) => typeof x === "string" && x).join("\n"); return joined || undefined; }
+  return typeof sp === "string" && sp ? sp : undefined;
+}
+
+/** Some hosts put bare strings inside user content arrays; treat them as text blocks. */
+function asTextIfString(c: unknown): { type: "text"; text: string } | undefined {
+  return typeof c === "string" ? { type: "text", text: c } : undefined;
+}
+
+// =============================================================================
 // OpenAI-format message conversion  (for OpenAI / MoonshotAI / etc.)
 // =============================================================================
 
-function toOpenAIMessages(systemPrompt: string | undefined, messages: Message[]): unknown[] {
+function toOpenAIMessages(
+  systemPrompt: string | string[] | undefined, messages: Message[], opts: { replayReasoningContent?: boolean } = {},
+): unknown[] {
   const out: unknown[] = [];
-  if (systemPrompt) out.push({ role: "system", content: systemPrompt });
+  const sys = normalizeSystemPrompt(systemPrompt);
+  if (sys) out.push({ role: "system", content: sys });
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -334,9 +426,10 @@ function toOpenAIMessages(systemPrompt: string | undefined, messages: Message[])
         out.push({ role: "user", content: msg.content });
       } else {
         out.push({ role: "user", content: msg.content.map((c) =>
-          c.type === "text"  ? { type: "text", text: (c as TextContent).text } :
+          asTextIfString(c) ??
+          (c.type === "text"  ? { type: "text", text: (c as TextContent).text } :
           c.type === "image" ? { type: "image_url", image_url: { url: `data:${(c as ImageContent).mimeType};base64,${(c as ImageContent).data}` } } :
-          { type: "text", text: "" }
+          { type: "text", text: "" })
         )});
       }
     } else if (msg.role === "assistant") {
@@ -345,8 +438,15 @@ function toOpenAIMessages(systemPrompt: string | undefined, messages: Message[])
       const tcs = msg.content.filter((b) => b.type === "toolCall").map((b) => ({
         id: (b as any).id, type: "function", function: { name: (b as any).name, arguments: JSON.stringify((b as any).arguments) },
       }));
-      if (text) entry.content = text;
+      // Always a string: Azure rejects a null/absent content on an assistant
+      // turn, which a tool-call-only turn would otherwise produce.
+      entry.content = text;
       if (tcs.length) entry.tool_calls = tcs;
+      // DeepSeek rejects replayed assistant turns without reasoning_content
+      // once thinking is on; an empty string is accepted.
+      if (opts.replayReasoningContent) {
+        entry.reasoning_content = msg.content.filter((b) => b.type === "thinking").map((b) => (b as ThinkingContent).thinking).join("\n");
+      }
       out.push(entry);
     } else if (msg.role === "toolResult") {
       const m = msg as ToolResultMessage;
@@ -373,24 +473,37 @@ function toAnthropicMessages(messages: Message[]): unknown[] {
         out.push({ role: "user", content: msg.content });
       } else {
         out.push({ role: "user", content: msg.content.map((c) =>
-          c.type === "text" ? { type: "text", text: (c as TextContent).text } :
+          asTextIfString(c) ??
+          (c.type === "text" ? { type: "text", text: (c as TextContent).text } :
           c.type === "image" ? { type: "image", source: { type: "base64", media_type: (c as ImageContent).mimeType, data: (c as ImageContent).data } } :
-          { type: "text", text: "" }
+          { type: "text", text: "" })
         )});
       }
     } else if (msg.role === "assistant") {
       const blocks: unknown[] = [];
       for (const b of msg.content) {
         if (b.type === "text" && (b as TextContent).text.trim()) blocks.push({ type: "text", text: (b as TextContent).text });
-        if (b.type === "thinking") blocks.push({ type: "thinking", thinking: (b as ThinkingContent).thinking, signature: (b as ThinkingContent).thinkingSignature ?? "" });
+        // Anthropic rejects a thinking block with empty text, and one with a
+        // missing signature. Replay only blocks that have both.
+        if (b.type === "thinking") {
+          const t = b as ThinkingContent;
+          if (t.thinking.trim() && t.thinkingSignature) blocks.push({ type: "thinking", thinking: t.thinking, signature: t.thinkingSignature });
+        }
         if (b.type === "toolCall") blocks.push({ type: "tool_use", id: (b as any).id, name: (b as any).name, input: (b as any).arguments });
       }
       if (blocks.length) out.push({ role: "assistant", content: blocks });
     } else if (msg.role === "toolResult") {
       const m = msg as ToolResultMessage;
       const text = m.content.filter((c): c is TextContent => c.type === "text").map((c) => c.text).join("\n");
-      // Anthropic tool results go inside a user message
-      out.push({ role: "user", content: [{ type: "tool_result", tool_use_id: m.toolCallId, content: text, is_error: m.isError }] });
+      // Anthropic tool results go inside a user message, and every result for a
+      // turn must sit in the single user message that follows it. Merge
+      // consecutive results into one message instead of emitting one each.
+      const block = { type: "tool_result", tool_use_id: m.toolCallId, content: text, is_error: m.isError };
+      const prev = out[out.length - 1] as { role?: string; content?: unknown[] } | undefined;
+      const prevIsResults = prev?.role === "user" && Array.isArray(prev.content) && prev.content.length > 0
+        && prev.content.every((c) => (c as { type?: string }).type === "tool_result");
+      if (prevIsResults) prev!.content!.push(block);
+      else out.push({ role: "user", content: [block] });
     }
   }
   return out;
@@ -413,14 +526,18 @@ function streamOpenAI(
   baseHost: string, auth: ProviderAuth, route: Extract<ApiRoute, { kind: "openai-chat-completions" }>,
 ): Promise<void> {
   return (async () => {
-    const url = `${baseHost}/openai/deployments/${model.id}/chat/completions?api-version=2024-10-21`;
-    const maxOutput = options?.maxTokens ?? model.maxTokens;
+    const url = `${auth.gatewayUrl ?? baseHost}/openai/deployments/${model.id}/chat/completions?api-version=2024-10-21`;
     const body: Record<string, unknown> = {
-      messages: toOpenAIMessages(context.systemPrompt, context.messages),
-      [route.tokenLimit]: maxOutput,
+      messages: toOpenAIMessages(context.systemPrompt, transformMessages(context.messages, model), { replayReasoningContent: route.reasoning.replayReasoningContent }),
       stream: true,
       stream_options: { include_usage: true },
     };
+    // Only send an output cap when the caller asks for one, as pi-ai's own
+    // OpenAI provider does. Some catalog maxTokens values equal the context
+    // window (Kimi), and Azure rejects input + max_tokens > window with a 400.
+    if (options?.maxTokens) body[route.tokenLimit] = options.maxTokens;
+    const effort = resolveReasoningEffort(route.reasoning, options?.reasoning);
+    if (effort !== undefined) body.reasoning_effort = effort;
     if (context.tools?.length) body.tools = toOpenAITools(context.tools);
 
     const token = await auth.getToken();
@@ -432,7 +549,7 @@ function streamOpenAI(
         : { "Authorization": `Bearer ${token}` };
     const response = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json", ...authHeaders },
+      headers: { "Content-Type": "application/json", ...auth.headers, ...authHeaders },
       body: JSON.stringify(body),
       signal: options?.signal,
     });
@@ -463,7 +580,18 @@ function streamOpenAI(
       if (!choice?.delta) continue;
       const delta = choice.delta;
 
-      if (typeof delta.content === "string") {
+      // Reasoning deltas: DeepSeek/Kimi use `reasoning_content`, other
+      // OpenAI-compatible endpoints use `reasoning` or `reasoning_text`.
+      // Surface them as a thinking block, same as pi-ai's own OpenAI provider.
+      const reasoningDelta = [delta.reasoning_content, delta.reasoning, delta.reasoning_text]
+        .find((r): r is string => typeof r === "string" && r.length > 0);
+      if (reasoningDelta) {
+        let idx = output.content.findIndex((b) => b.type === "thinking");
+        if (idx === -1) { output.content.push({ type: "thinking", thinking: "" } as ThinkingContent); idx = output.content.length - 1; stream.push({ type: "thinking_start", contentIndex: idx, partial: output }); }
+        const block = output.content[idx]; if (block.type === "thinking") { (block as ThinkingContent).thinking += reasoningDelta; stream.push({ type: "thinking_delta", contentIndex: idx, delta: reasoningDelta, partial: output }); }
+      }
+
+      if (typeof delta.content === "string" && delta.content.length > 0) {
         let idx = output.content.findIndex((b) => b.type === "text");
         if (idx === -1) { output.content.push({ type: "text", text: "" }); idx = output.content.length - 1; stream.push({ type: "text_start", contentIndex: idx, partial: output }); }
         const block = output.content[idx]; if (block.type === "text") { block.text += delta.content; stream.push({ type: "text_delta", contentIndex: idx, delta: delta.content, partial: output }); }
@@ -492,7 +620,11 @@ function streamOpenAI(
     }
 
     // Finalize blocks
-    for (let i = 0; i < output.content.length; i++) { if (output.content[i].type === "text") stream.push({ type: "text_end", contentIndex: i, content: (output.content[i] as TextContent).text, partial: output }); }
+    for (let i = 0; i < output.content.length; i++) {
+      const b = output.content[i];
+      if (b.type === "text") stream.push({ type: "text_end", contentIndex: i, content: (b as TextContent).text, partial: output });
+      else if (b.type === "thinking") stream.push({ type: "thinking_end", contentIndex: i, content: (b as ThinkingContent).thinking, partial: output });
+    }
     for (const [tci, ci] of tcContentIdx) { const b = output.content[ci]; if (b.type === "toolCall") { try { b.arguments = JSON.parse(tcJsonBufs.get(tci) ?? "{}"); } catch {} stream.push({ type: "toolcall_end", contentIndex: ci, toolCall: b, partial: output }); } }
   })();
 }
@@ -507,14 +639,15 @@ function streamAnthropic(
   baseHost: string, auth: ProviderAuth,
 ): Promise<void> {
   return (async () => {
-    const url = `${baseHost}/anthropic/v1/messages`;
+    const url = `${auth.gatewayUrl ?? baseHost}/anthropic/v1/messages`;
     const body: Record<string, unknown> = {
       model: model.id,
-      messages: toAnthropicMessages(context.messages),
+      messages: toAnthropicMessages(transformMessages(context.messages, model)),
       max_tokens: options?.maxTokens ?? model.maxTokens,
       stream: true,
     };
-    if (context.systemPrompt) body.system = context.systemPrompt;
+    const sys = normalizeSystemPrompt(context.systemPrompt);
+    if (sys) body.system = sys;
     if (context.tools?.length) body.tools = toAnthropicTools(context.tools);
 
     const token = await auth.getToken();
@@ -524,6 +657,7 @@ function streamAnthropic(
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        ...auth.headers,
         "Authorization": `Bearer ${token}`,
         "anthropic-version": "2023-06-01",
       },
@@ -648,10 +782,10 @@ function streamAzureFoundry(
 
     try {
       const baseHost = new URL(model.baseUrl).origin;
-      const route = apiRouteMap.get(model.id) ?? { kind: "openai-chat-completions", tokenLimit: "max_tokens" };
+      const route = apiRouteMap.get(model.id) ?? { kind: "openai-chat-completions", tokenLimit: "max_tokens", reasoning: { enabled: false, replayReasoningContent: false } };
       // Resolve auth: use registered provider auth, fall back to api-key from options.
       const auth: ProviderAuth = providerAuthMap.get(model.provider)
-        ?? { type: "api-key", getToken: () => Promise.resolve(options?.apiKey ?? "") };
+        ?? { type: "api-key", getToken: () => Promise.resolve(options?.apiKey ?? ""), headers: {} };
 
       if (route.kind === "anthropic-messages") {
         await streamAnthropic(model, context, options, output, stream, baseHost, auth);
@@ -706,7 +840,11 @@ export default async function (pi: ExtensionAPI) {
 
   const providerId = "azure-foundry";
   // Store the auth context so streamAzureFoundry can build the right headers per-request.
-  providerAuthMap.set(providerId, { type: config.auth.type, getToken });
+  const gatewayUrl = config.gatewayUrl?.replace(/\/+$/, "") || undefined;
+  if (gatewayUrl) console.log(`[Azure Foundry] Chat requests routed through gateway: ${gatewayUrl}`);
+  const headers = config.headers ?? {};
+  if (Object.keys(headers).length) console.log(`[Azure Foundry] Extra request headers: ${Object.keys(headers).join(", ")}`);
+  providerAuthMap.set(providerId, { type: config.auth.type, getToken, gatewayUrl, headers });
 
   pi.registerProvider(providerId, {
     name: "Azure Foundry",
@@ -722,3 +860,6 @@ export default async function (pi: ExtensionAPI) {
 
   console.log(`[Azure Foundry] ✓ Registered ${deployments.length} model(s)`);
 }
+
+// Exported for tests only.
+export { toOpenAIMessages, toAnthropicMessages };
