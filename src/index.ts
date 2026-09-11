@@ -323,9 +323,20 @@ async function* parseSSE(reader: ReadableStreamDefaultReader<Uint8Array>): Async
 // OpenAI-format message conversion  (for OpenAI / MoonshotAI / etc.)
 // =============================================================================
 
-function toOpenAIMessages(systemPrompt: string | undefined, messages: Message[]): unknown[] {
+// Context.systemPrompt can be a plain string or an array of cacheable text
+// blocks (Anthropic-style); the OpenAI-compat surface only accepts a string.
+type SystemPromptInput = string | Array<string | { text?: string }> | undefined;
+
+function flattenSystemPrompt(systemPrompt: SystemPromptInput): string | undefined {
+  if (!systemPrompt) return undefined;
+  if (typeof systemPrompt === "string") return systemPrompt;
+  return systemPrompt.map((b) => (typeof b === "string" ? b : (b?.text ?? ""))).join("\n");
+}
+
+function toOpenAIMessages(systemPrompt: SystemPromptInput, messages: Message[]): unknown[] {
   const out: unknown[] = [];
-  if (systemPrompt) out.push({ role: "system", content: systemPrompt });
+  const flatSystemPrompt = flattenSystemPrompt(systemPrompt);
+  if (flatSystemPrompt) out.push({ role: "system", content: flatSystemPrompt });
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
