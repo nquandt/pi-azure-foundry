@@ -243,8 +243,8 @@ const apiRouteMap = new Map<string, ApiRoute>();
 /** Infer OpenAI-compat token limit from resolved metadata or model name patterns. */
 function inferOpenAITokenLimit(modelName: string, resolved: ResolvedModelDetails): OpenAITokenLimitParam {
   if (resolved.openaiTokenLimit) return resolved.openaiTokenLimit;
-  // GPT-5 and o-series models reject max_tokens on Azure/OpenAI chat completions
-  if (/^(gpt-5|o[1-9])([-.]|$)/i.test(modelName)) return "max_completion_tokens";
+  // GPT-5+ and o-series models reject max_tokens on Azure/OpenAI chat completions
+  if (/^(gpt-[5-9]|gpt-[1-9][0-9]|o[1-9])([-.]|$)/i.test(modelName)) return "max_completion_tokens";
   return "max_tokens";
 }
 
